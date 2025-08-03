@@ -1,10 +1,9 @@
 services:
   - type: web
-    name: flask-ai-app
-    runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn server:app --bind 0.0.0.0:$PORT
+    name: flask-tensorflow-api
+    env: python
+    buildCommand: ""
+    startCommand: gunicorn server:app
     envVars:
       - key: PYTHON_VERSION
         value: 3.10
-    plan: free

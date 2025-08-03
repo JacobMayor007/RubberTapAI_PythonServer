@@ -2,11 +2,8 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from tensorflow.keras.models import load_model
 from tensorflow.keras.optimizers import Adam
-import base64
-import cv2
 import numpy as np
 import io
-import time
 from PIL import Image
 import threading
 import os
