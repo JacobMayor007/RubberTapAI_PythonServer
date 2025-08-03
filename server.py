@@ -6,7 +6,6 @@ import base64
 import cv2
 import numpy as np
 import io
-import time
 from PIL import Image
 import threading
 import os
@@ -14,54 +13,44 @@ import os
 app = Flask(__name__)
 CORS(app)
 
-# Configuration - Update these paths to match your actual files
-MODEL_PATH = os.path.join('model', 'model.h5')  # Path to your model file
-LABELS_PATH = os.path.join('model', 'labels.txt')  # Path to your labels file
+MODEL_PATH = os.path.join('model', 'model.h5')
+LABELS_PATH = os.path.join('model', 'labels.txt')
 
-# Global variables for frame processing
-latest_frame = None
-frame_lock = threading.Lock()
-processing_enabled = False
-analysis_results = {}
+model = None
+class_names = []
 
-# Initialize model
-try:
-    model = load_model(MODEL_PATH)
-    model.compile(optimizer=Adam(), 
-                loss='categorical_crossentropy',
-                metrics=['accuracy'])
-    print("✅ Model loaded successfully!")
-except Exception as e:
-    print(f"❌ Model loading failed: {str(e)}")
-    model = None
+def load_model_lazy():
+    global model
+    if model is None:
+        model = load_model(MODEL_PATH)
+        model.compile(optimizer=Adam(), loss='categorical_crossentropy', metrics=['accuracy'])
 
-# Load class labels
+# Load labels once
 try:
     with open(LABELS_PATH, "r") as f:
         class_names = [line.strip() for line in f if line.strip()]
     print(f"✅ Loaded {len(class_names)} classes")
 except Exception as e:
     print(f"❌ Label loading failed: {str(e)}")
-    class_names = []
 
 def preprocess_image(image_file):
-    """Process uploaded image for single prediction endpoint"""
     img = Image.open(io.BytesIO(image_file.read())).convert('RGB')
-    img = img.resize((224, 224)) 
+    img = img.resize((224, 224))
     img_array = np.array(img).astype("float32") / 255.0
     return np.expand_dims(img_array, axis=0)
 
-@app.route('/api/live/results', methods=['GET'])
-def get_results():
-    """Get latest analysis results"""
-    return jsonify(analysis_results)
+@app.route('/')
+@app.route('/health')
+def health_check():
+    return jsonify({"status": "ok"}), 200
 
 @app.route('/predict', methods=['POST'])
 def predict():
-    """Single image prediction endpoint"""
+    load_model_lazy()
+    
     if not model or not class_names:
         return jsonify({"error": "Model not ready"}), 503
-        
+
     if 'image' not in request.files:
         return jsonify({"error": "No image uploaded"}), 400
 
@@ -72,7 +61,7 @@ def predict():
     try:
         img_array = preprocess_image(file)
         predictions = model.predict(img_array)[0]
-        
+
         results = {
             "predictions": [
                 {
@@ -84,9 +73,9 @@ def predict():
             "predictedClass": class_names[np.argmax(predictions)],
             "confidence": float(np.max(predictions))
         }
-        
+
         return jsonify(results)
-        
+
     except Exception as e:
         return jsonify({
             "error": "Prediction failed",
@@ -94,4 +83,6 @@ def predict():
         }), 500
 
 if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=5000, threaded=True)
+    from os import getenv
+    port = int(getenv("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, threaded=True)
