@@ -1,0 +1,7 @@
+0 Oidium Heveae
+1 Leaf Spot
+2 Healthy
+3 Anthracnose
+4 Other
+5 Mango
+6 Papaya
