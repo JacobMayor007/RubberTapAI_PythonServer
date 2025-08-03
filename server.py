@@ -1,5 +1,6 @@
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # Force CPU mode
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Reduce TensorFlow logging
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -11,117 +12,160 @@ import numpy as np
 from PIL import Image
 import io
 import logging
+import threading
 
 # Setup Flask
 app = Flask(__name__)
-CORS(app)
+CORS(app)  # Enable CORS for all routes
+
+# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Paths
-MODEL_PATH = 'model/model.h5'
-LABELS_PATH = 'model/labels.txt'
+# Paths - ensure these match your Render.com file structure
+MODEL_PATH = os.path.join('model', 'model.h5')
+LABELS_PATH = os.path.join('model', 'labels.txt')
 
-# Patch DepthwiseConv2D to ignore 'groups' param if it exists
-class DepthwiseConv2DPatched(DepthwiseConv2D):
+# Custom DepthwiseConv2D to handle version compatibility
+class PatchedDepthwiseConv2D(DepthwiseConv2D):
     def __init__(self, *args, **kwargs):
-        kwargs.pop('groups', None)  # Remove unsupported param
+        kwargs.pop('groups', None)  # Remove problematic parameter
         super().__init__(*args, **kwargs)
 
-get_custom_objects()['DepthwiseConv2D'] = DepthwiseConv2DPatched
+# Register our custom layer
+get_custom_objects()['DepthwiseConv2D'] = PatchedDepthwiseConv2D
 
-# Model Loader Class
 class ModelLoader:
     def __init__(self):
         self.model = None
         self.class_names = []
         self.load_attempted = False
+        self.lock = threading.Lock()
 
     def load_model(self):
-        if self.load_attempted:
-            return
-        self.load_attempted = True
+        with self.lock:
+            if self.load_attempted:
+                return
+            self.load_attempted = True
 
-        # Load labels
-        try:
-            with open(LABELS_PATH, "r") as f:
-                self.class_names = [line.strip() for line in f if line.strip()]
-            logger.info(f"✅ Loaded {len(self.class_names)} classes")
-        except Exception as e:
-            logger.error(f"❌ Label loading failed: {str(e)}")
-            return
+            # Load labels first
+            try:
+                with open(LABELS_PATH, "r") as f:
+                    self.class_names = [line.strip() for line in f if line.strip()]
+                logger.info(f"✅ Loaded {len(self.class_names)} classes")
+            except Exception as e:
+                logger.error(f"❌ Label loading failed: {str(e)}")
+                return
 
-        # Load model
-        try:
-            self.model = load_model(MODEL_PATH, compile=False)
-            logger.info("✅ Model file loaded")
+            # Load model with multiple fallback strategies
+            try:
+                try:
+                    # First attempt: regular load
+                    self.model = load_model(
+                        MODEL_PATH,
+                        compile=False,
+                        custom_objects={'DepthwiseConv2D': PatchedDepthwiseConv2D}
+                    )
+                except Exception as e:
+                    logger.warning(f"First load attempt failed, trying alternative: {str(e)}")
+                    # Fallback: load weights only
+                    from tensorflow.keras.models import model_from_json
+                    with open(MODEL_PATH.replace('.h5', '.json'), 'r') as json_file:
+                        self.model = model_from_json(json_file.read())
+                    self.model.load_weights(MODEL_PATH)
 
-            # Optional: Fix input shape if needed
-            expected_shape = (224, 224, 3)
-            actual_shape = self.model.input_shape[1:]
-            if actual_shape != expected_shape:
-                logger.warning(f"⚠️ Input shape mismatch. Expected {expected_shape}, got {actual_shape}")
-                new_input = Input(shape=expected_shape)
-                output = self.model(new_input)
-                self.model = Model(inputs=new_input, outputs=output)
+                # Verify and fix input shape if needed
+                if len(self.model.inputs) > 1:
+                    logger.info("🔧 Fixing multi-input model...")
+                    new_input = Input(shape=(224, 224, 3), name='fixed_input')
+                    output = self.model(new_input)
+                    self.model = Model(inputs=new_input, outputs=output)
 
-            # Compile
-            self.model.compile(optimizer=Adam(), loss='categorical_crossentropy', metrics=['accuracy'])
+                # Compile model
+                self.model.compile(
+                    optimizer=Adam(learning_rate=0.001),
+                    loss='categorical_crossentropy',
+                    metrics=['accuracy']
+                )
 
-            # Warm up model
-            self.model.predict(np.zeros((1, 224, 224, 3)))
-            logger.info("✅ Model loaded and ready!")
-        except Exception as e:
-            logger.error(f"❌ Model loading failed: {str(e)}")
-            self.model = None
+                # Warm up the model
+                logger.info("🔥 Warming up model...")
+                self.model.predict(np.zeros((1, 224, 224, 3)))
+                logger.info("✅ Model loaded and ready!")
 
-# Instantiate the model loader
+            except Exception as e:
+                logger.error(f"❌ Model loading failed: {str(e)}")
+                self.model = None
+
+# Initialize model loader
 model_loader = ModelLoader()
 
-# Health check route
+# Start loading the model in background
+threading.Thread(target=model_loader.load_model, daemon=True).start()
+
 @app.route('/health', methods=['GET'])
-def health():
-    model_loader.load_model()
+def health_check():
     return jsonify({
         'model_loaded': model_loader.model is not None,
         'labels_loaded': len(model_loader.class_names) > 0,
-        'status': 'ready' if model_loader.model else 'failed'
+        'status': 'ready' if model_loader.model else 'initializing',
+        'endpoints': {
+            'POST /predict': 'Image classification endpoint',
+            'GET /health': 'Service health check'
+        }
     })
 
-# Prediction endpoint
 @app.route('/predict', methods=['POST'])
 def predict():
-    model_loader.load_model()
-
-    if not model_loader.model:
+    if model_loader.model is None:
         return jsonify({
-            "error": "Model not available",
-            "details": "Server failed to load the AI model"
+            "error": "Model not ready",
+            "details": "Server is still initializing the AI model"
         }), 503
 
     if 'image' not in request.files:
-        return jsonify({"error": "No image provided"}), 400
+        return jsonify({
+            "error": "No image provided",
+            "details": "Please include an image file in your request"
+        }), 400
 
     try:
-        img = Image.open(io.BytesIO(request.files['image'].read())).convert('RGB')
+        # Process image
+        file = request.files['image']
+        if file.filename == '':
+            return jsonify({"error": "Empty file"}), 400
+
+        img = Image.open(io.BytesIO(file.read()))
+        if img.mode != 'RGB':
+            img = img.convert('RGB')
+        
         img = img.resize((224, 224))
         img_array = np.array(img).astype("float32") / 255.0
         img_array = np.expand_dims(img_array, axis=0)
 
-        preds = model_loader.model.predict(img_array)[0]
+        # Make prediction
+        predictions = model_loader.model.predict(img_array)[0]
+        
         return jsonify({
             "predictions": [
-                {"className": model_loader.class_names[i], "probability": float(preds[i])}
+                {
+                    "className": model_loader.class_names[i],
+                    "probability": float(predictions[i])
+                }
                 for i in range(len(model_loader.class_names))
             ],
-            "predictedClass": model_loader.class_names[np.argmax(preds)],
-            "confidence": float(np.max(preds))
+            "predictedClass": model_loader.class_names[np.argmax(predictions)],
+            "confidence": float(np.max(predictions))
         })
 
     except Exception as e:
         logger.error(f"Prediction error: {str(e)}")
-        return jsonify({"error": "Prediction failed", "details": str(e)}), 500
+        return jsonify({
+            "error": "Prediction failed",
+            "details": str(e)
+        }), 500
 
-# Run the server
 if __name__ == '__main__':
-    app.run(host="0.0.0.0", port=5000)
+    # Use PORT from environment for Render.com
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, threaded=True)
