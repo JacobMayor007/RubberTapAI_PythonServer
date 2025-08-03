@@ -12,21 +12,18 @@ import numpy as np
 from PIL import Image
 import io
 import logging
-import threading
 
-# Setup Flask
 app = Flask(__name__)
-CORS(app)  # Enable CORS for all routes
+CORS(app)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Paths - ensure these match your Render.com file structure
 MODEL_PATH = os.path.join('model', 'model.h5')
 LABELS_PATH = os.path.join('model', 'labels.txt')
 
-# Custom DepthwiseConv2D to handle version compatibility
+# Custom DepthwiseConv2D to handle version incompatibility
 class PatchedDepthwiseConv2D(DepthwiseConv2D):
     def __init__(self, *args, **kwargs):
         kwargs.pop('groups', None)  # Remove problematic parameter
@@ -40,132 +37,98 @@ class ModelLoader:
         self.model = None
         self.class_names = []
         self.load_attempted = False
-        self.lock = threading.Lock()
 
     def load_model(self):
-        with self.lock:
-            if self.load_attempted:
-                return
-            self.load_attempted = True
+        if self.load_attempted:
+            return
+        self.load_attempted = True
 
-            # Load labels first
-            try:
-                with open(LABELS_PATH, "r") as f:
-                    self.class_names = [line.strip() for line in f if line.strip()]
-                logger.info(f"✅ Loaded {len(self.class_names)} classes")
-            except Exception as e:
-                logger.error(f"❌ Label loading failed: {str(e)}")
-                return
+        # Load labels first
+        try:
+            with open(LABELS_PATH, "r") as f:
+                self.class_names = [line.strip() for line in f if line.strip()]
+            logger.info(f"✅ Loaded {len(self.class_names)} classes")
+        except Exception as e:
+            logger.error(f"❌ Label loading failed: {str(e)}")
+            return
 
-            # Load model with multiple fallback strategies
-            try:
-                try:
-                    # First attempt: regular load
-                    self.model = load_model(
-                        MODEL_PATH,
-                        compile=False,
-                        custom_objects={'DepthwiseConv2D': PatchedDepthwiseConv2D}
-                    )
-                except Exception as e:
-                    logger.warning(f"First load attempt failed, trying alternative: {str(e)}")
-                    # Fallback: load weights only
-                    from tensorflow.keras.models import model_from_json
-                    with open(MODEL_PATH.replace('.h5', '.json'), 'r') as json_file:
-                        self.model = model_from_json(json_file.read())
-                    self.model.load_weights(MODEL_PATH)
+        # Load model with proper input handling
+        try:
+            # Load the model
+            self.model = load_model(
+                MODEL_PATH,
+                compile=False,
+                custom_objects={'DepthwiseConv2D': PatchedDepthwiseConv2D}
+            )
+            logger.info("✅ Model loaded successfully")
 
-                # Verify and fix input shape if needed
-                if len(self.model.inputs) > 1:
-                    logger.info("🔧 Fixing multi-input model...")
-                    new_input = Input(shape=(224, 224, 3), name='fixed_input')
-                    output = self.model(new_input)
-                    self.model = Model(inputs=new_input, outputs=output)
+            # Fix multi-input issue by creating a new single-input model
+            if len(self.model.inputs) > 1:
+                logger.info("🔧 Converting multi-input model to single input...")
+                new_input = Input(shape=(224, 224, 3))
+                output = self.model([new_input, new_input])  # Duplicate input for both expected inputs
+                self.model = Model(inputs=new_input, outputs=output)
 
-                # Compile model
-                self.model.compile(
-                    optimizer=Adam(learning_rate=0.001),
-                    loss='categorical_crossentropy',
-                    metrics=['accuracy']
-                )
+            self.model.compile(
+                optimizer=Adam(learning_rate=0.001),
+                loss='categorical_crossentropy',
+                metrics=['accuracy']
+            )
 
-                # Warm up the model
-                logger.info("🔥 Warming up model...")
-                self.model.predict(np.zeros((1, 224, 224, 3)))
-                logger.info("✅ Model loaded and ready!")
+            # Warm up the model
+            logger.info("🔥 Warming up model...")
+            self.model.predict(np.zeros((1, 224, 224, 3)))
+            logger.info("✅ Model ready for predictions!")
 
-            except Exception as e:
-                logger.error(f"❌ Model loading failed: {str(e)}")
-                self.model = None
+        except Exception as e:
+            logger.error(f"❌ Model loading failed: {str(e)}")
+            self.model = None
 
 # Initialize model loader
 model_loader = ModelLoader()
 
-# Start loading the model in background
-threading.Thread(target=model_loader.load_model, daemon=True).start()
-
 @app.route('/health', methods=['GET'])
-def health_check():
+def health():
+    model_loader.load_model()
     return jsonify({
         'model_loaded': model_loader.model is not None,
         'labels_loaded': len(model_loader.class_names) > 0,
-        'status': 'ready' if model_loader.model else 'initializing',
-        'endpoints': {
-            'POST /predict': 'Image classification endpoint',
-            'GET /health': 'Service health check'
-        }
+        'status': 'ready' if model_loader.model else 'failed'
     })
 
 @app.route('/predict', methods=['POST'])
 def predict():
-    if model_loader.model is None:
+    model_loader.load_model()
+    
+    if not model_loader.model:
         return jsonify({
-            "error": "Model not ready",
-            "details": "Server is still initializing the AI model"
+            "error": "Model not available",
+            "details": "Server failed to load the AI model"
         }), 503
 
     if 'image' not in request.files:
-        return jsonify({
-            "error": "No image provided",
-            "details": "Please include an image file in your request"
-        }), 400
+        return jsonify({"error": "No image provided"}), 400
 
     try:
-        # Process image
-        file = request.files['image']
-        if file.filename == '':
-            return jsonify({"error": "Empty file"}), 400
-
-        img = Image.open(io.BytesIO(file.read()))
-        if img.mode != 'RGB':
-            img = img.convert('RGB')
-        
+        img = Image.open(io.BytesIO(request.files['image'].read())).convert('RGB')
         img = img.resize((224, 224))
         img_array = np.array(img).astype("float32") / 255.0
         img_array = np.expand_dims(img_array, axis=0)
 
-        # Make prediction
-        predictions = model_loader.model.predict(img_array)[0]
-        
+        preds = model_loader.model.predict(img_array)[0]
         return jsonify({
             "predictions": [
-                {
-                    "className": model_loader.class_names[i],
-                    "probability": float(predictions[i])
-                }
+                {"className": model_loader.class_names[i], "probability": float(preds[i])}
                 for i in range(len(model_loader.class_names))
             ],
-            "predictedClass": model_loader.class_names[np.argmax(predictions)],
-            "confidence": float(np.max(predictions))
+            "predictedClass": model_loader.class_names[np.argmax(preds)],
+            "confidence": float(np.max(preds))
         })
 
     except Exception as e:
         logger.error(f"Prediction error: {str(e)}")
-        return jsonify({
-            "error": "Prediction failed",
-            "details": str(e)
-        }), 500
+        return jsonify({"error": "Prediction failed", "details": str(e)}), 500
 
 if __name__ == '__main__':
-    # Use PORT from environment for Render.com
-    port = int(os.environ.get('PORT', 8080))
+    port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port, threaded=True)
